@@ -1,0 +1,21 @@
+# Environment variables — NEVER commit this
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# ML model files (large binaries — store separately)
+*.h5
+*.pkl
+
+# OS
+.DS_Store
+Thumbs.db
+
+# VS Code
+.vscode/

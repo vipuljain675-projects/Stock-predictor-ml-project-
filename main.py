@@ -583,7 +583,15 @@ def run_7day_prediction(model, scaler, target_scaler, is_fallback, stock_df, new
 
         pred_df = pd.DataFrame({'Close': adj_predictions}, index=future_dates)
         raw_df = pd.DataFrame({'Close': raw_predictions}, index=future_dates)
-        return last_price, adj_predictions[0], pred_df, raw_predictions[0], raw_df, 0.84, True
+
+        # Derive a real confidence score from the model's saved directional accuracy.
+        # directional_accuracy is stored in feature_config as a percentage (e.g. 52.24).
+        # We normalise it to [0, 1]. A model that calls direction correctly 50% of the time
+        # is no better than a coin-flip, so we floor at 0.50 and scale to [0, 1].
+        raw_dir_acc = feature_config.get("directional_accuracy", 50.0) if feature_config else 50.0
+        confidence_score = float(np.clip(raw_dir_acc / 100.0, 0.0, 1.0))
+
+        return last_price, adj_predictions[0], pred_df, raw_predictions[0], raw_df, confidence_score, True
     except Exception:
         return last_price, None, None, None, None, None, False
 

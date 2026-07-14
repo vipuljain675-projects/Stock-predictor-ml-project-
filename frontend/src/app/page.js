@@ -674,17 +674,17 @@ export default function AegisDashboard() {
             </div>
 
             {/* Chat Messages Log */}
-            <div className="flex-1 overflow-y-auto p-6 flex flex-col gap-4 bg-zinc-50/20">
+            <div className="flex-1 overflow-y-auto p-6 flex flex-col gap-5 bg-zinc-50/20">
               {chatMessages.map((msg, idx) => (
                 <div
                   key={idx}
                   className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}
                 >
                   <div
-                    className={`max-w-2xl rounded-2xl px-4 py-3 text-xs leading-relaxed shadow-sm ${
+                    className={`max-w-[92%] rounded-2xl px-5 py-4 text-[15px] leading-relaxed shadow-sm ${
                       msg.role === "user"
                         ? "bg-zinc-900 text-white font-medium rounded-tr-none"
-                        : "bg-white border border-zinc-200 text-zinc-800 rounded-tl-none font-medium"
+                        : "bg-white border border-zinc-200 text-zinc-950 rounded-tl-none font-medium"
                     }`}
                   >
                     {msg.content}
@@ -710,12 +710,12 @@ export default function AegisDashboard() {
                 value={chatInput}
                 onChange={(e) => setChatInput(e.target.value)}
                 placeholder="Ask about geopolitical correlations, supply chain shock biases, or macro triggers..."
-                className="flex-1 border border-zinc-200 rounded-xl px-4 py-2.5 text-xs text-zinc-950 focus:outline-none focus:ring-1 focus:ring-zinc-900 focus:border-zinc-900"
+                className="flex-1 border border-zinc-200 rounded-xl px-4 py-2.5 text-sm text-zinc-950 focus:outline-none focus:ring-1 focus:ring-zinc-900 focus:border-zinc-900"
               />
               <button
                 type="submit"
                 disabled={chatLoading}
-                className="bg-zinc-950 hover:bg-zinc-800 text-white px-5 py-2.5 rounded-xl text-xs font-semibold flex items-center gap-2 transition-all shadow-sm disabled:opacity-50 disabled:cursor-not-allowed"
+                className="bg-zinc-950 hover:bg-zinc-800 text-white px-5 py-2.5 rounded-xl text-sm font-semibold flex items-center gap-2 transition-all shadow-sm disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 <span>Send</span>
                 <Send className="h-3.5 w-3.5" />

@@ -189,7 +189,7 @@ export default function AegisDashboard() {
       <header className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-6 border-b border-zinc-200/80 pb-6">
         <div>
           <div className="flex items-center gap-2 mb-1">
-            <h1 className="text-3xl font-extrabold text-zinc-950 tracking-tight">Aegis Markets</h1>
+            <h1 className="text-3xl font-extrabold text-zinc-950 tracking-tight">GeoQuant AI</h1>
             <span className="font-mono text-xs font-semibold bg-zinc-100 text-zinc-600 px-2 py-0.5 rounded">v3.5 Live</span>
           </div>
           <p className="text-sm text-zinc-500 font-medium">Real-time market forecasting and geopolitical impact analysis console.</p>

@@ -20,7 +20,7 @@ from groq import Groq
 # Load env variables
 load_dotenv()
 
-app = FastAPI(title="Aegis Markets API")
+app = FastAPI(title="GeoQuant AI API")
 
 # Enable CORS for Next.js development server
 app.add_middleware(

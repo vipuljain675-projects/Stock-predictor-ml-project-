@@ -40,11 +40,13 @@ export default function AegisDashboard() {
   const [chatLoading, setChatLoading] = useState(false);
   const chatEndRef = useRef(null);
 
+  const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+
   const fetchDashboardData = async (symbol) => {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch(`http://localhost:8000/api/market-data?symbol=${symbol}`);
+      const res = await fetch(`${API_BASE}/api/market-data?symbol=${symbol}`);
       if (!res.ok) {
         throw new Error("Failed to fetch market data from backend server");
       }
@@ -75,7 +77,7 @@ export default function AegisDashboard() {
     setChatLoading(true);
 
     try {
-      const res = await fetch("http://localhost:8000/api/chat", {
+      const res = await fetch(`${API_BASE}/api/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

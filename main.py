@@ -233,6 +233,8 @@ def compute_aegis_macro_score(macro_data: dict, ticker_symbol: str) -> float:
     return float(np.clip(score, -1, 1))
 
 def detect_market_shocks(news_df: pd.DataFrame, ticker_symbol: str) -> Optional[dict]:
+    """Keyword-based fallback detector — used when no Gemini key is configured or
+    the LLM call fails for any reason. See detect_market_shocks_llm() for the primary path."""
     SUPPLY_SHOCK_KEYWORDS = [
         'hormuz', 'strait of hormuz', 'blockade', 'tanker attack', 'tanker seized',
         'oil field attack', 'pipeline attack', 'refinery strike', 'shipping disruption',
@@ -250,6 +252,9 @@ def detect_market_shocks(news_df: pd.DataFrame, ticker_symbol: str) -> Optional[
         'layoffs surge', 'manufacturing slumps', 'growth stalls', 'global slowdown'
     ]
 
+    if news_df.empty:
+        return None
+
     recent = news_df.sort_values('date', ascending=False).head(15)
 
     for _, row in recent.iterrows():
@@ -258,7 +263,8 @@ def detect_market_shocks(news_df: pd.DataFrame, ticker_symbol: str) -> Optional[
             return {
                 'type': 'Supply shock', 'headline': row['title'],
                 'crude_dir': 'up', 'nifty_dir': 'down',
-                'reasoning': 'Supply-side disruption → oil supply risk rises → crude up, costlier imports drag Nifty down'
+                'reasoning': 'Supply-side disruption → oil supply risk rises → crude up, costlier imports drag Nifty down',
+                'magnitude': 1.0, 'source': 'keyword'
             }
     for _, row in recent.iterrows():
         title_lower = row['title'].lower()
@@ -266,7 +272,8 @@ def detect_market_shocks(news_df: pd.DataFrame, ticker_symbol: str) -> Optional[
             return {
                 'type': 'De-escalation', 'headline': row['title'],
                 'crude_dir': 'down', 'nifty_dir': 'up',
-                'reasoning': 'Tension easing → supply risk removed → crude down, cheaper imports lift Nifty up'
+                'reasoning': 'Tension easing → supply risk removed → crude down, cheaper imports lift Nifty up',
+                'magnitude': 1.0, 'source': 'keyword'
             }
     for _, row in recent.iterrows():
         title_lower = row['title'].lower()
@@ -274,9 +281,90 @@ def detect_market_shocks(news_df: pd.DataFrame, ticker_symbol: str) -> Optional[
             return {
                 'type': 'Demand shock', 'headline': row['title'],
                 'crude_dir': 'down', 'nifty_dir': 'down',
-                'reasoning': 'Recession/slowdown fears → weaker demand outlook → both crude and Nifty pressured down'
+                'reasoning': 'Recession/slowdown fears → weaker demand outlook → both crude and Nifty pressured down',
+                'magnitude': 1.0, 'source': 'keyword'
             }
     return None
+
+
+# ── LLM-based shock detector (primary path) ─────────────────────────
+# Simple in-memory cache to avoid burning API quota — one Gemini call
+# serves every request for a given ticker within the TTL window.
+_shock_cache: Dict[str, dict] = {}
+_SHOCK_CACHE_TTL_SECONDS = 1800  # 30 minutes
+
+def detect_market_shocks_llm(news_df: pd.DataFrame, ticker_symbol: str, api_key: str) -> Optional[dict]:
+    """Classifies today's headlines with Gemini instead of exact keyword matching, so
+    paraphrased events ('Iran threatens to shut key oil corridor') are still caught.
+    Falls back to the keyword matcher on missing key, parse failure, or any API error —
+    the app must never break because of this layer."""
+    if not api_key or news_df.empty:
+        return detect_market_shocks(news_df, ticker_symbol)
+
+    cache_key = f"{ticker_symbol}:{news_df['title'].iloc[0] if len(news_df) else ''}"
+    cached = _shock_cache.get(cache_key)
+    if cached and (datetime.now() - cached['ts']).total_seconds() < _SHOCK_CACHE_TTL_SECONDS:
+        return cached['result']
+
+    try:
+        recent = news_df.sort_values('date', ascending=False).head(15)
+        headlines_text = "\n".join(f"- {row['title']}" for _, row in recent.iterrows())
+        asset_label = "Brent Crude Oil" if ticker_symbol == "BZ=F" else "Nifty 50 (Indian stock index)"
+
+        prompt = f"""You are a quant analyst classifying geopolitical/macro news for its market impact on {asset_label}.
+
+Headlines (most recent first):
+{headlines_text}
+
+Classify the SINGLE most significant event across these headlines into exactly one category:
+- "supply_shock": disrupts oil supply (blockades, attacks on tankers/pipelines/refineries, chokepoint closures, OPEC cuts)
+- "de_escalation": reduces tension/risk (ceasefires, peace talks, sanctions lifted, OPEC output increases)
+- "demand_shock": weakens economic growth outlook (recession signals, GDP contraction, demand destruction)
+- "neutral": none of the above are clearly present
+
+Respond with ONLY raw JSON, no markdown fences, no commentary:
+{{"category": "supply_shock|de_escalation|demand_shock|neutral", "magnitude": 0.0-1.0, "headline": "the specific headline driving this", "reasoning": "one sentence"}}"""
+
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(model='gemini-2.5-flash', contents=prompt)
+        text = response.text.strip()
+        if text.startswith("```"):
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+        result = json.loads(text.strip())
+
+        category = result.get("category", "neutral")
+        type_map = {
+            "supply_shock": ("Supply shock", "up", "down",
+                'Supply-side disruption → oil supply risk rises → crude up, costlier imports drag Nifty down'),
+            "de_escalation": ("De-escalation", "down", "up",
+                'Tension easing → supply risk removed → crude down, cheaper imports lift Nifty up'),
+            "demand_shock": ("Demand shock", "down", "down",
+                'Recession/slowdown fears → weaker demand outlook → both crude and Nifty pressured down'),
+        }
+        if category not in type_map:
+            _shock_cache[cache_key] = {'ts': datetime.now(), 'result': None}
+            return None
+
+        type_label, crude_dir, nifty_dir, default_reasoning = type_map[category]
+        magnitude = float(np.clip(float(result.get("magnitude", 0.5)), 0.0, 1.0))
+
+        shock = {
+            'type': type_label,
+            'headline': result.get("headline", recent.iloc[0]['title']),
+            'crude_dir': crude_dir,
+            'nifty_dir': nifty_dir,
+            'reasoning': result.get("reasoning", default_reasoning),
+            'magnitude': magnitude,
+            'source': 'llm'
+        }
+        _shock_cache[cache_key] = {'ts': datetime.now(), 'result': shock}
+        return shock
+    except Exception:
+        # Quota hit, network error, bad JSON — never let this break the dashboard
+        return detect_market_shocks(news_df, ticker_symbol)
+
 
 def get_asset_impact(title: str, ticker_symbol: str):
     t = title.lower()
@@ -438,7 +526,7 @@ def engineer_features(ohlcv_df, sentiment_series, macro_series_dict):
 
     return df
 
-def run_7day_prediction(model, scaler, target_scaler, is_fallback, stock_df, news_df, macro_data, ticker_symbol="BZ=F", feature_config=None):
+def run_7day_prediction(model, scaler, target_scaler, is_fallback, stock_df, news_df, macro_data, ticker_symbol="BZ=F", feature_config=None, gemini_api_key: str = ""):
     if news_df.empty:
         daily_news = pd.Series(dtype=float)
     else:
@@ -489,27 +577,29 @@ def run_7day_prediction(model, scaler, target_scaler, is_fallback, stock_df, new
         if np.isnan(volatility) or volatility == 0:
             volatility = 0.008 if ticker_symbol == "^NSEI" else 0.015
 
-        # Fetch shock info
-        shock = detect_market_shocks(news_df, ticker_symbol)
+        # Fetch shock info — LLM classifier first (paraphrase-aware), keyword matcher as fallback
+        shock = detect_market_shocks_llm(news_df, ticker_symbol, gemini_api_key)
+        shock_magnitude = shock.get('magnitude', 1.0) if shock else 1.0
 
-        # Volatility-scaled Geopolitical Adjustment
+        # Volatility-scaled Geopolitical Adjustment, now scaled by event magnitude/confidence
+        # (a "minor mention" event pushes the price far less than a "major crisis" one)
         geopolitical_adjustment = 0.0
         if ticker_symbol == "BZ=F":
             # Brent Crude rises on geopolitical tension (negative sentiment)
             geopolitical_adjustment = -current_sentiment * volatility
             if shock:
                 if shock['type'] == 'Supply shock':
-                    geopolitical_adjustment += 1.5 * volatility
+                    geopolitical_adjustment += 1.5 * volatility * shock_magnitude
                 elif shock['type'] == 'De-escalation':
-                    geopolitical_adjustment -= 1.5 * volatility
+                    geopolitical_adjustment -= 1.5 * volatility * shock_magnitude
         else:  # ^NSEI
             # Nifty falls on geopolitical tension (negative sentiment)
             geopolitical_adjustment = current_sentiment * 0.8 * volatility
             if shock:
                 if shock['type'] == 'Supply shock':
-                    geopolitical_adjustment -= 1.2 * volatility
+                    geopolitical_adjustment -= 1.2 * volatility * shock_magnitude
                 elif shock['type'] == 'De-escalation':
-                    geopolitical_adjustment += 1.2 * volatility
+                    geopolitical_adjustment += 1.2 * volatility * shock_magnitude
 
         # 1. RAW ML MODEL FORECAST LOOP
         raw_predictions = []
@@ -625,13 +715,12 @@ def get_market_data(symbol: str = Query(..., description="BZ=F or ^NSEI")):
     model, scaler, target_scaler, is_fallback, feature_config = load_ml_assets(symbol)
 
     # Predictions
-    # Predictions
     last_close, next_predict, future_forecast_df, next_predict_raw, future_forecast_raw_df, confidence_score, model_usable = run_7day_prediction(
-        model, scaler, target_scaler, is_fallback, stock_df, news_feed, macro_data, symbol, feature_config
+        model, scaler, target_scaler, is_fallback, stock_df, news_feed, macro_data, symbol, feature_config, gemini_api_key=api_key
     )
 
-    # Shock detection
-    shock = detect_market_shocks(news_feed, symbol)
+    # Shock detection (LLM-based, same cache as the prediction call above)
+    shock = detect_market_shocks_llm(news_feed, symbol, api_key)
 
     # Build response data structure
     historical_chart = []
@@ -737,7 +826,7 @@ def handle_chat(req: ChatRequest):
 
     model, scaler, target_scaler, is_fallback, feature_config = load_ml_assets(req.ticker_symbol)
     last_close, next_predict, _, _, _, _, model_usable = run_7day_prediction(
-        model, scaler, target_scaler, is_fallback, stock_df, news_feed, macro_data, req.ticker_symbol, feature_config
+        model, scaler, target_scaler, is_fallback, stock_df, news_feed, macro_data, req.ticker_symbol, feature_config, gemini_api_key=api_key
     )
 
     headline_list = "\n".join([f"- {row['title']} (Sentiment: {row['sentiment']:.2f})" for _, row in news_feed.head(5).iterrows()]) if not news_feed.empty else "No recent headlines available"

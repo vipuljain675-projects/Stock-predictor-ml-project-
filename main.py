@@ -15,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from google import genai
+from groq import Groq
 
 # Load env variables
 load_dotenv()
@@ -233,8 +234,8 @@ def compute_aegis_macro_score(macro_data: dict, ticker_symbol: str) -> float:
     return float(np.clip(score, -1, 1))
 
 def detect_market_shocks(news_df: pd.DataFrame, ticker_symbol: str) -> Optional[dict]:
-    """Keyword-based fallback detector — used when no Gemini key is configured or
-    the LLM call fails for any reason. See detect_market_shocks_llm() for the primary path."""
+    """Keyword-based fallback detector — used when no Gemini/Groq key is configured or
+    the LLM call fails for any reason."""
     SUPPLY_SHOCK_KEYWORDS = [
         'hormuz', 'strait of hormuz', 'blockade', 'tanker attack', 'tanker seized',
         'oil field attack', 'pipeline attack', 'refinery strike', 'shipping disruption',
@@ -288,30 +289,29 @@ def detect_market_shocks(news_df: pd.DataFrame, ticker_symbol: str) -> Optional[
 
 
 # ── LLM-based shock detector (primary path) ─────────────────────────
-# Simple in-memory cache to avoid burning API quota — one Gemini call
+# Simple in-memory cache to avoid burning API quota — one LLM call
 # serves every request for a given ticker within the TTL window.
 _shock_cache: Dict[str, dict] = {}
 _SHOCK_CACHE_TTL_SECONDS = 1800  # 30 minutes
 
-def detect_market_shocks_llm(news_df: pd.DataFrame, ticker_symbol: str, api_key: str) -> Optional[dict]:
-    """Classifies today's headlines with Gemini instead of exact keyword matching, so
-    paraphrased events ('Iran threatens to shut key oil corridor') are still caught.
-    Falls back to the keyword matcher on missing key, parse failure, or any API error —
-    the app must never break because of this layer."""
-    if not api_key or news_df.empty:
-        return detect_market_shocks(news_df, ticker_symbol)
+def detect_market_shocks_llm(news_df: pd.DataFrame, ticker_symbol: str, groq_key: str = "", gemini_key: str = "") -> Optional[dict]:
+    """Classifies today's headlines with an LLM (Groq preferred, Gemini secondary)
+    instead of exact keyword matching, so paraphrased events are still caught.
+    Falls back to the keyword matcher on missing keys or API failures."""
+    if news_df.empty:
+        return None
 
+    # Check cache first
     cache_key = f"{ticker_symbol}:{news_df['title'].iloc[0] if len(news_df) else ''}"
     cached = _shock_cache.get(cache_key)
     if cached and (datetime.now() - cached['ts']).total_seconds() < _SHOCK_CACHE_TTL_SECONDS:
         return cached['result']
 
-    try:
-        recent = news_df.sort_values('date', ascending=False).head(15)
-        headlines_text = "\n".join(f"- {row['title']}" for _, row in recent.iterrows())
-        asset_label = "Brent Crude Oil" if ticker_symbol == "BZ=F" else "Nifty 50 (Indian stock index)"
+    recent = news_df.sort_values('date', ascending=False).head(15)
+    headlines_text = "\n".join(f"- {row['title']}" for _, row in recent.iterrows())
+    asset_label = "Brent Crude Oil" if ticker_symbol == "BZ=F" else "Nifty 50 (Indian stock index)"
 
-        prompt = f"""You are a quant analyst classifying geopolitical/macro news for its market impact on {asset_label}.
+    prompt = f"""You are a quant analyst classifying geopolitical/macro news for its market impact on {asset_label}.
 
 Headlines (most recent first):
 {headlines_text}
@@ -325,45 +325,85 @@ Classify the SINGLE most significant event across these headlines into exactly o
 Respond with ONLY raw JSON, no markdown fences, no commentary:
 {{"category": "supply_shock|de_escalation|demand_shock|neutral", "magnitude": 0.0-1.0, "headline": "the specific headline driving this", "reasoning": "one sentence"}}"""
 
-        client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(model='gemini-2.5-flash', contents=prompt)
-        text = response.text.strip()
-        if text.startswith("```"):
-            text = text.split("```")[1]
-            if text.startswith("json"):
-                text = text[4:]
-        result = json.loads(text.strip())
+    # 1. Groq Path (Preferred for zero latency & high quota)
+    if groq_key:
+        try:
+            client = Groq(api_key=groq_key)
+            completion = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"}
+            )
+            result = json.loads(completion.choices[0].message.content.strip())
+            category = result.get("category", "neutral")
+            
+            type_map = {
+                "supply_shock": ("Supply shock", "up", "down", 'Supply-side disruption → oil supply risk rises → crude up, costlier imports drag Nifty down'),
+                "de_escalation": ("De-escalation", "down", "up", 'Tension easing → supply risk removed → crude down, cheaper imports lift Nifty up'),
+                "demand_shock": ("Demand shock", "down", "down", 'Recession/slowdown fears → weaker demand outlook → both crude and Nifty pressured down'),
+            }
+            if category not in type_map:
+                _shock_cache[cache_key] = {'ts': datetime.now(), 'result': None}
+                return None
 
-        category = result.get("category", "neutral")
-        type_map = {
-            "supply_shock": ("Supply shock", "up", "down",
-                'Supply-side disruption → oil supply risk rises → crude up, costlier imports drag Nifty down'),
-            "de_escalation": ("De-escalation", "down", "up",
-                'Tension easing → supply risk removed → crude down, cheaper imports lift Nifty up'),
-            "demand_shock": ("Demand shock", "down", "down",
-                'Recession/slowdown fears → weaker demand outlook → both crude and Nifty pressured down'),
-        }
-        if category not in type_map:
-            _shock_cache[cache_key] = {'ts': datetime.now(), 'result': None}
-            return None
+            type_label, crude_dir, nifty_dir, default_reasoning = type_map[category]
+            magnitude = float(np.clip(float(result.get("magnitude", 0.5)), 0.0, 1.0))
 
-        type_label, crude_dir, nifty_dir, default_reasoning = type_map[category]
-        magnitude = float(np.clip(float(result.get("magnitude", 0.5)), 0.0, 1.0))
+            shock = {
+                'type': type_label,
+                'headline': result.get("headline", recent.iloc[0]['title']),
+                'crude_dir': crude_dir,
+                'nifty_dir': nifty_dir,
+                'reasoning': result.get("reasoning", default_reasoning),
+                'magnitude': magnitude,
+                'source': 'groq'
+            }
+            _shock_cache[cache_key] = {'ts': datetime.now(), 'result': shock}
+            return shock
+        except Exception:
+            pass  # Fall through to Gemini if Groq fails
 
-        shock = {
-            'type': type_label,
-            'headline': result.get("headline", recent.iloc[0]['title']),
-            'crude_dir': crude_dir,
-            'nifty_dir': nifty_dir,
-            'reasoning': result.get("reasoning", default_reasoning),
-            'magnitude': magnitude,
-            'source': 'llm'
-        }
-        _shock_cache[cache_key] = {'ts': datetime.now(), 'result': shock}
-        return shock
-    except Exception:
-        # Quota hit, network error, bad JSON — never let this break the dashboard
-        return detect_market_shocks(news_df, ticker_symbol)
+    # 2. Gemini Path (Secondary / Fallback)
+    if gemini_key:
+        try:
+            client = genai.Client(api_key=gemini_key)
+            response = client.models.generate_content(model='gemini-2.5-flash', contents=prompt)
+            text = response.text.strip()
+            if text.startswith("```"):
+                text = text.split("```")[1]
+                if text.startswith("json"):
+                    text = text[4:]
+            result = json.loads(text.strip())
+
+            category = result.get("category", "neutral")
+            type_map = {
+                "supply_shock": ("Supply shock", "up", "down", 'Supply-side disruption → oil supply risk rises → crude up, costlier imports drag Nifty down'),
+                "de_escalation": ("De-escalation", "down", "up", 'Tension easing → supply risk removed → crude down, cheaper imports lift Nifty up'),
+                "demand_shock": ("Demand shock", "down", "down", 'Recession/slowdown fears → weaker demand outlook → both crude and Nifty pressured down'),
+            }
+            if category not in type_map:
+                _shock_cache[cache_key] = {'ts': datetime.now(), 'result': None}
+                return None
+
+            type_label, crude_dir, nifty_dir, default_reasoning = type_map[category]
+            magnitude = float(np.clip(float(result.get("magnitude", 0.5)), 0.0, 1.0))
+
+            shock = {
+                'type': type_label,
+                'headline': result.get("headline", recent.iloc[0]['title']),
+                'crude_dir': crude_dir,
+                'nifty_dir': nifty_dir,
+                'reasoning': result.get("reasoning", default_reasoning),
+                'magnitude': magnitude,
+                'source': 'gemini'
+            }
+            _shock_cache[cache_key] = {'ts': datetime.now(), 'result': shock}
+            return shock
+        except Exception:
+            pass
+
+    # 3. Keyword Matcher Path (Final safe fallback)
+    return detect_market_shocks(news_df, ticker_symbol)
 
 
 def get_asset_impact(title: str, ticker_symbol: str):
@@ -526,7 +566,7 @@ def engineer_features(ohlcv_df, sentiment_series, macro_series_dict):
 
     return df
 
-def run_7day_prediction(model, scaler, target_scaler, is_fallback, stock_df, news_df, macro_data, ticker_symbol="BZ=F", feature_config=None, gemini_api_key: str = ""):
+def run_7day_prediction(model, scaler, target_scaler, is_fallback, stock_df, news_df, macro_data, ticker_symbol="BZ=F", feature_config=None, groq_api_key: str = "", gemini_api_key: str = ""):
     if news_df.empty:
         daily_news = pd.Series(dtype=float)
     else:
@@ -577,12 +617,11 @@ def run_7day_prediction(model, scaler, target_scaler, is_fallback, stock_df, new
         if np.isnan(volatility) or volatility == 0:
             volatility = 0.008 if ticker_symbol == "^NSEI" else 0.015
 
-        # Fetch shock info — LLM classifier first (paraphrase-aware), keyword matcher as fallback
-        shock = detect_market_shocks_llm(news_df, ticker_symbol, gemini_api_key)
+        # Fetch shock info — Groq/Gemini classifier first, keyword matcher as fallback
+        shock = detect_market_shocks_llm(news_df, ticker_symbol, groq_key=groq_api_key, gemini_key=gemini_api_key)
         shock_magnitude = shock.get('magnitude', 1.0) if shock else 1.0
 
         # Volatility-scaled Geopolitical Adjustment, now scaled by event magnitude/confidence
-        # (a "minor mention" event pushes the price far less than a "major crisis" one)
         geopolitical_adjustment = 0.0
         if ticker_symbol == "BZ=F":
             # Brent Crude rises on geopolitical tension (negative sentiment)
@@ -675,9 +714,6 @@ def run_7day_prediction(model, scaler, target_scaler, is_fallback, stock_df, new
         raw_df = pd.DataFrame({'Close': raw_predictions}, index=future_dates)
 
         # Derive a real confidence score from the model's saved directional accuracy.
-        # directional_accuracy is stored in feature_config as a percentage (e.g. 52.24).
-        # We normalise it to [0, 1]. A model that calls direction correctly 50% of the time
-        # is no better than a coin-flip, so we floor at 0.50 and scale to [0, 1].
         raw_dir_acc = feature_config.get("directional_accuracy", 50.0) if feature_config else 50.0
         confidence_score = float(np.clip(raw_dir_acc / 100.0, 0.0, 1.0))
 
@@ -698,9 +734,11 @@ def get_market_data(symbol: str = Query(..., description="BZ=F or ^NSEI")):
     if stock_df.empty:
         raise HTTPException(status_code=500, detail="Failed to fetch stock history")
 
-    # Fetch news
-    api_key = os.environ.get("GEMINI_API_KEY", "")
-    news_feed, news_is_live = fetch_news_via_gemini(api_key)
+    # Fetch news (Gemini Search used if key present, fallback to RSS)
+    gemini_key = os.environ.get("GEMINI_API_KEY", "")
+    groq_key = os.environ.get("GROQ_API_KEY", "")
+    
+    news_feed, news_is_live = fetch_news_via_gemini(gemini_key)
     news_source = "Gemini+Search"
     if not news_is_live:
         news_feed, news_is_live = fetch_live_rss_news()
@@ -716,11 +754,11 @@ def get_market_data(symbol: str = Query(..., description="BZ=F or ^NSEI")):
 
     # Predictions
     last_close, next_predict, future_forecast_df, next_predict_raw, future_forecast_raw_df, confidence_score, model_usable = run_7day_prediction(
-        model, scaler, target_scaler, is_fallback, stock_df, news_feed, macro_data, symbol, feature_config, gemini_api_key=api_key
+        model, scaler, target_scaler, is_fallback, stock_df, news_feed, macro_data, symbol, feature_config, groq_api_key=groq_key, gemini_api_key=gemini_key
     )
 
     # Shock detection (LLM-based, same cache as the prediction call above)
-    shock = detect_market_shocks_llm(news_feed, symbol, api_key)
+    shock = detect_market_shocks_llm(news_feed, symbol, groq_key=groq_key, gemini_key=gemini_key)
 
     # Build response data structure
     historical_chart = []
@@ -807,16 +845,19 @@ def get_market_data(symbol: str = Query(..., description="BZ=F or ^NSEI")):
 
 @app.post("/api/chat")
 def handle_chat(req: ChatRequest):
-    api_key = os.environ.get("GEMINI_API_KEY", "")
-    if not api_key:
-        raise HTTPException(status_code=400, detail="Gemini API Key is not configured in backend .env")
+    groq_key = os.environ.get("GROQ_API_KEY", "")
+    gemini_key = os.environ.get("GEMINI_API_KEY", "")
+    
+    if not groq_key and not gemini_key:
+        raise HTTPException(status_code=400, detail="Neither GROQ_API_KEY nor GEMINI_API_KEY is configured in backend environment.")
 
     # Fetch context to construct prompt
     stock_df = fetch_live_stock_data(req.ticker_symbol)
     if stock_df.empty:
         raise HTTPException(status_code=500, detail="Failed to fetch stock history for context")
 
-    news_feed, news_is_live = fetch_news_via_gemini(api_key)
+    # Use Gemini if key present, fallback to RSS
+    news_feed, news_is_live = fetch_news_via_gemini(gemini_key)
     if not news_is_live:
         news_feed, _ = fetch_live_rss_news()
 
@@ -826,7 +867,7 @@ def handle_chat(req: ChatRequest):
 
     model, scaler, target_scaler, is_fallback, feature_config = load_ml_assets(req.ticker_symbol)
     last_close, next_predict, _, _, _, _, model_usable = run_7day_prediction(
-        model, scaler, target_scaler, is_fallback, stock_df, news_feed, macro_data, req.ticker_symbol, feature_config, gemini_api_key=api_key
+        model, scaler, target_scaler, is_fallback, stock_df, news_feed, macro_data, req.ticker_symbol, feature_config, groq_api_key=groq_key, gemini_api_key=gemini_key
     )
 
     headline_list = "\n".join([f"- {row['title']} (Sentiment: {row['sentiment']:.2f})" for _, row in news_feed.head(5).iterrows()]) if not news_feed.empty else "No recent headlines available"
@@ -860,12 +901,42 @@ def handle_chat(req: ChatRequest):
     User Query: {req.query}
     """
 
-    try:
-        client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=context_prompt
-        )
-        return {"response": response.text}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Gemini API Error: {str(e)}")
+    # 1. Groq Chat Generation (Preferred)
+    if groq_key:
+        try:
+            client = Groq(api_key=groq_key)
+            api_messages = [{"role": "system", "content": context_prompt}]
+            
+            # Map conversation history
+            for msg in req.messages:
+                # API expects assistant role instead of model/assistant mappings sometimes, standardizing roles
+                role = "assistant" if msg["role"] in ["assistant", "model"] else "user"
+                api_messages.append({"role": role, "content": msg["content"]})
+                
+            # Add latest user query
+            api_messages.append({"role": "user", "content": req.query})
+
+            completion = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=api_messages,
+                temperature=0.3
+            )
+            return {"response": completion.choices[0].message.content}
+        except Exception as e:
+            # If Groq fails, let it fallback to Gemini below
+            if not gemini_key:
+                raise HTTPException(status_code=500, detail=f"Groq API Error: {str(e)}")
+
+    # 2. Gemini Chat Generation (Fallback)
+    if gemini_key:
+        try:
+            client = genai.Client(api_key=gemini_key)
+            response = client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=context_prompt
+            )
+            return {"response": response.text}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Gemini API Error: {str(e)}")
+
+    raise HTTPException(status_code=500, detail="LLM generation failed on both Groq and Gemini paths.")

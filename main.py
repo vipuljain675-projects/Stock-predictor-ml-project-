@@ -851,49 +851,79 @@ def handle_chat(req: ChatRequest):
     if not groq_key and not gemini_key:
         raise HTTPException(status_code=400, detail="Neither GROQ_API_KEY nor GEMINI_API_KEY is configured in backend environment.")
 
-    # Fetch context to construct prompt
-    stock_df = fetch_live_stock_data(req.ticker_symbol)
-    if stock_df.empty:
-        raise HTTPException(status_code=500, detail="Failed to fetch stock history for context")
-
-    # Use Gemini if key present, fallback to RSS
+    # Fetch news (Gemini Search used if key present, fallback to RSS)
     news_feed, news_is_live = fetch_news_via_gemini(gemini_key)
     if not news_is_live:
         news_feed, _ = fetch_live_rss_news()
-
-    macro_data = fetch_macro_indicators(req.ticker_symbol)
-    macro_score = compute_aegis_macro_score(macro_data, req.ticker_symbol)
     avg_sentiment = float(news_feed['sentiment'].mean()) if not news_feed.empty else 0.0
 
-    model, scaler, target_scaler, is_fallback, feature_config = load_ml_assets(req.ticker_symbol)
-    last_close, next_predict, _, _, _, _, model_usable = run_7day_prediction(
-        model, scaler, target_scaler, is_fallback, stock_df, news_feed, macro_data, req.ticker_symbol, feature_config, groq_api_key=groq_key, gemini_api_key=gemini_key
-    )
+    # 1. Fetch & Predict Brent Crude (BZ=F)
+    stock_df_bz = fetch_live_stock_data("BZ=F")
+    close_bz = 0.0
+    change_pct_bz = 0.0
+    macro_score_bz = 0.0
+    macro_context_bz = "Unavailable"
+    
+    if not stock_df_bz.empty:
+        close_bz = float(stock_df_bz['Close'].iloc[-1])
+        macro_data_bz = fetch_macro_indicators("BZ=F")
+        macro_score_bz = compute_aegis_macro_score(macro_data_bz, "BZ=F")
+        macro_context_bz = ", ".join([f"{sig['label']}: {sig['value']:.2f} ({sig['change_pct']:+.2f}%)" for sig in macro_data_bz.values()])
+        
+        model_bz, scaler_bz, ts_bz, is_fb_bz, config_bz = load_ml_assets("BZ=F")
+        _, pred_bz, _, _, _, _, usable_bz = run_7day_prediction(
+            model_bz, scaler_bz, ts_bz, is_fb_bz, stock_df_bz, news_feed, macro_data_bz, "BZ=F", config_bz, groq_api_key=groq_key, gemini_api_key=gemini_key
+        )
+        if pred_bz:
+            change_pct_bz = ((pred_bz - close_bz) / close_bz * 100)
+
+    # 2. Fetch & Predict Nifty 50 (^NSEI)
+    stock_df_nifty = fetch_live_stock_data("^NSEI")
+    close_nifty = 0.0
+    change_pct_nifty = 0.0
+    macro_score_nifty = 0.0
+    macro_context_nifty = "Unavailable"
+    
+    if not stock_df_nifty.empty:
+        close_nifty = float(stock_df_nifty['Close'].iloc[-1])
+        macro_data_nifty = fetch_macro_indicators("^NSEI")
+        macro_score_nifty = compute_aegis_macro_score(macro_data_nifty, "^NSEI")
+        macro_context_nifty = ", ".join([f"{sig['label']}: {sig['value']:.2f} ({sig['change_pct']:+.2f}%)" for sig in macro_data_nifty.values()])
+        
+        model_nifty, scaler_nifty, ts_nifty, is_fb_nifty, config_nifty = load_ml_assets("^NSEI")
+        _, pred_nifty, _, _, _, _, usable_nifty = run_7day_prediction(
+            model_nifty, scaler_nifty, ts_nifty, is_fb_nifty, stock_df_nifty, news_feed, macro_data_nifty, "^NSEI", config_nifty, groq_api_key=groq_key, gemini_api_key=gemini_key
+        )
+        if pred_nifty:
+            change_pct_nifty = ((pred_nifty - close_nifty) / close_nifty * 100)
 
     headline_list = "\n".join([f"- {row['title']} (Sentiment: {row['sentiment']:.2f})" for _, row in news_feed.head(5).iterrows()]) if not news_feed.empty else "No recent headlines available"
-    macro_context = "\n".join([f"- {sig['label']}: {sig['value']:.2f} (30d change: {sig['change_pct']:+.2f}%)" for sig in macro_data.values()]) if macro_data else "Macro indicators unavailable"
-
-    change_pct = ((next_predict - last_close) / last_close * 100) if next_predict else 0.0
 
     context_prompt = f"""
     You are 'Aegis Intel', a world-class geopolitical analyst and quantitative financial advisor specializing in Indian and global markets.
-    Your job is to provide specific, data-driven answers to user queries regarding {"Brent Crude Oil" if req.ticker_symbol == "BZ=F" else "Nifty 50"} ({req.ticker_symbol}).
+    Your job is to provide specific, data-driven answers to user queries. You have access to real-time metrics for BOTH Brent Crude Oil and the Nifty 50 Index.
     
-    Current Market Context:
-    - Asset: {"Brent Crude Oil" if req.ticker_symbol == "BZ=F" else "Nifty 50"} ({req.ticker_symbol})
-    - Current Price: {last_close:,.2f}
-    - LSTM Predicted Change in 24h: {change_pct:+.2f}%
+    Current Brent Crude Oil (BZ=F) Context:
+    - Current Price: ${close_bz:,.2f}
+    - LSTM Predicted Change in 24h: {change_pct_bz:+.2f}%
     - Geopolitical Sentiment: {avg_sentiment:.2f} (range -1 tension to +1 peace)
-    - Aegis Composite Macro Score: {macro_score*100:+.1f}/100
+    - Aegis Composite Macro Score: {macro_score_bz*100:+.1f}/100
+    - Brent Macro Indicators: {macro_context_bz}
     
-    Live Macro Indicators (30-day trend):
-    {macro_context}
+    Current Nifty 50 (^NSEI) Context:
+    - Current Price: ₹{close_nifty:,.2f}
+    - LSTM Predicted Change in 24h: {change_pct_nifty:+.2f}%
+    - Aegis Composite Macro Score: {macro_score_nifty*100:+.1f}/100
+    - Nifty Macro Indicators: {macro_context_nifty}
     
     Recent News Headlines:
     {headline_list}
     
+    Active Ticker in User's View: {"Brent Crude Oil" if req.ticker_symbol == "BZ=F" else "Nifty 50"}
+    
     Instructions:
-    - Use macro context (USD/INR, VIX, crude, yields) in your reasoning, especially for India/Nifty questions.
+    - You have live price and prediction statistics for BOTH Brent Crude Oil and Nifty 50. Use them to answer queries about either asset, or cross-asset correlations.
+    - If Nifty is selected but the user asks about Crude (or vice versa), refer to the correct live values provided above instead of guessing or using old training cutoffs.
     - Be specific about numbers, correlations, and causality chains.
     - Explain the difference between supply-driven and demand-driven crude moves for India context.
     - Respond in a professional, analytical tone. Be concise but insightful.
@@ -909,7 +939,6 @@ def handle_chat(req: ChatRequest):
             
             # Map conversation history
             for msg in req.messages:
-                # API expects assistant role instead of model/assistant mappings sometimes, standardizing roles
                 role = "assistant" if msg["role"] in ["assistant", "model"] else "user"
                 api_messages.append({"role": role, "content": msg["content"]})
                 
@@ -923,7 +952,6 @@ def handle_chat(req: ChatRequest):
             )
             return {"response": completion.choices[0].message.content}
         except Exception as e:
-            # If Groq fails, let it fallback to Gemini below
             if not gemini_key:
                 raise HTTPException(status_code=500, detail=f"Groq API Error: {str(e)}")
 
@@ -940,3 +968,4 @@ def handle_chat(req: ChatRequest):
             raise HTTPException(status_code=500, detail=f"Gemini API Error: {str(e)}")
 
     raise HTTPException(status_code=500, detail="LLM generation failed on both Groq and Gemini paths.")
+

@@ -46,6 +46,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.on_event("startup")
+def preload_models():
+    print("Preloading ML models at startup...", flush=True)
+    try:
+        load_ml_assets("BZ=F")
+        load_ml_assets("^NSEI")
+        print("ML models preloaded successfully!", flush=True)
+    except Exception as e:
+        print(f"Failed to preload models: {e}", flush=True)
+
 # ----------------- DATA PIPELINE FUNCTIONS -----------------
 
 import requests
@@ -547,8 +557,13 @@ def get_asset_impact(title: str, ticker_symbol: str):
             return 'bearish', reason
     return 'neutral', ''
 
+_ml_assets_cache = {}
+
 def load_ml_assets(ticker: str):
     clean_ticker = ticker.replace("^", "").replace("=", "")
+    if clean_ticker in _ml_assets_cache:
+        return _ml_assets_cache[clean_ticker]
+
     model_path  = f"lstm_model_{clean_ticker}.h5"
     scaler_path = f"scaler_{clean_ticker}.pkl"
     target_scaler_path = f"target_scaler_{clean_ticker}.pkl"
@@ -585,7 +600,10 @@ def load_ml_assets(ticker: str):
             if config_path and os.path.exists(config_path):
                 with open(config_path) as f:
                     feature_config = json.load(f)
-            return model, scaler, target_scaler, False, feature_config
+            
+            assets = (model, scaler, target_scaler, False, feature_config)
+            _ml_assets_cache[clean_ticker] = assets
+            return assets
         except Exception:
             return None, None, None, True, None
     return None, None, None, True, None

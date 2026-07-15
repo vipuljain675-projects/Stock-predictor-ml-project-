@@ -730,12 +730,14 @@ def run_7day_prediction(model, scaler, target_scaler, is_fallback, stock_df, new
                     geopolitical_adjustment -= 1.5 * volatility * shock_magnitude
         else:  # ^NSEI
             # Nifty falls on geopolitical tension (negative sentiment)
-            geopolitical_adjustment = current_sentiment * 0.8 * volatility
+            geopolitical_adjustment = current_sentiment * 0.4 * volatility
             if shock:
+                # Severity-based dynamic multiplier (Black Swan vs Routine News)
+                nifty_multiplier = 1.2 if shock_magnitude >= 0.8 else 0.4
                 if shock['type'] == 'Supply shock':
-                    geopolitical_adjustment -= 1.2 * volatility * shock_magnitude
+                    geopolitical_adjustment -= nifty_multiplier * volatility * shock_magnitude
                 elif shock['type'] == 'De-escalation':
-                    geopolitical_adjustment += 1.2 * volatility * shock_magnitude
+                    geopolitical_adjustment += nifty_multiplier * volatility * shock_magnitude
 
         # 1. RAW ML MODEL FORECAST LOOP
         raw_predictions = []

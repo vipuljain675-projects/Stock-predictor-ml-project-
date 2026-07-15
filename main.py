@@ -46,8 +46,7 @@ def fetch_live_stock_data(ticker: str) -> pd.DataFrame:
     end_date = datetime.now()
     start_date = end_date - timedelta(days=180)
     try:
-        session = get_yf_session()
-        data = yf.download(ticker, start=start_date.strftime('%Y-%m-%d'), session=session, auto_adjust=True, progress=False)
+        data = yf.download(ticker, start=start_date.strftime('%Y-%m-%d'), auto_adjust=True, progress=False)
         if isinstance(data.columns, pd.MultiIndex):
             data.columns = data.columns.get_level_values(0)
         if len(data) > 0:
@@ -188,10 +187,9 @@ def fetch_macro_indicators(ticker_symbol: str) -> dict:
     results = {}
     end = datetime.now()
     start = end - timedelta(days=60)
-    session = get_yf_session()
     for key, sig in signals.items():
         try:
-            df = yf.download(sig["ticker"], start=start.strftime('%Y-%m-%d'), session=session, progress=False, auto_adjust=True)
+            df = yf.download(sig["ticker"], start=start.strftime('%Y-%m-%d'), progress=False, auto_adjust=True)
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
             if not df.empty and 'Close' in df.columns:

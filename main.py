@@ -1,4 +1,14 @@
 import os
+import warnings
+# Suppress all Python warnings (e.g. Scikit-Learn version mismatch warning)
+warnings.filterwarnings("ignore")
+# Suppress TensorFlow C++ logs
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+
+import logging
+# Suppress absl / tensorflow python logging warnings
+logging.getLogger('tensorflow').setLevel(logging.ERROR)
+
 import pickle
 import json
 import urllib.request

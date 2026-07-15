@@ -53,17 +53,72 @@ import requests
 def get_yf_session():
     session = requests.Session()
     session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
     })
     return session
 
-def fetch_live_stock_data(ticker: str) -> pd.DataFrame:
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=180)
+def fetch_yahoo_chart_direct(ticker: str, range_str: str = "6mo") -> pd.DataFrame:
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1'
+    }
     try:
-        data = yf.download(ticker, start=start_date.strftime('%Y-%m-%d'), auto_adjust=True, progress=False)
-        if isinstance(data.columns, pd.MultiIndex):
-            data.columns = data.columns.get_level_values(0)
+        encoded_ticker = urllib.parse.quote(ticker)
+        url = f"https://query2.finance.yahoo.com/v8/finance/chart/{encoded_ticker}?range={range_str}&interval=1d"
+        res = requests.get(url, headers=headers, timeout=10)
+        if res.status_code != 200:
+            return pd.DataFrame()
+            
+        data = res.json()
+        result = data.get('chart', {}).get('result', [])
+        if not result:
+            return pd.DataFrame()
+            
+        chart_data = result[0]
+        timestamps = chart_data.get('timestamp', [])
+        if not timestamps:
+            return pd.DataFrame()
+            
+        indicators = chart_data.get('indicators', {})
+        quote = indicators.get('quote', [{}])[0]
+        adj_close = indicators.get('adjclose', [{}])[0].get('adjclose', [])
+        
+        dates = [datetime.fromtimestamp(t).replace(hour=0, minute=0, second=0, microsecond=0) for t in timestamps]
+        
+        n = len(timestamps)
+        open_list = quote.get('open', [None]*n)
+        high_list = quote.get('high', [None]*n)
+        low_list = quote.get('low', [None]*n)
+        close_list = adj_close if adj_close else quote.get('close', [None]*n)
+        volume_list = quote.get('volume', [0]*n)
+        
+        if not open_list: open_list = [None]*n
+        if not high_list: high_list = [None]*n
+        if not low_list: low_list = [None]*n
+        if not close_list: close_list = [None]*n
+        if not volume_list: volume_list = [0]*n
+        
+        df = pd.DataFrame({
+            'Open': open_list,
+            'High': high_list,
+            'Low': low_list,
+            'Close': close_list,
+            'Volume': volume_list
+        }, index=dates)
+        
+        df.dropna(subset=['Close'], inplace=True)
+        df.index = pd.to_datetime(df.index)
+        df.index.name = 'Date'
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+def fetch_live_stock_data(ticker: str) -> pd.DataFrame:
+    try:
+        data = fetch_yahoo_chart_direct(ticker, "6mo")
         if len(data) > 0:
             data = data[['Open', 'High', 'Low', 'Close', 'Volume']]
             data.columns = ['Open', 'High', 'Low', 'Close', 'Volume']
@@ -204,9 +259,9 @@ def fetch_macro_indicators(ticker_symbol: str) -> dict:
     start = end - timedelta(days=60)
     for key, sig in signals.items():
         try:
-            df = yf.download(sig["ticker"], start=start.strftime('%Y-%m-%d'), progress=False, auto_adjust=True)
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
+            df = fetch_yahoo_chart_direct(sig["ticker"], "3mo")
+            if not df.empty:
+                df = df[df.index >= start.strftime('%Y-%m-%d')]
             if not df.empty and 'Close' in df.columns:
                 close = df['Close'].dropna()
                 if isinstance(close, pd.DataFrame):

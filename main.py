@@ -8,6 +8,11 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 import logging
 # Suppress absl / tensorflow python logging warnings
 logging.getLogger('tensorflow').setLevel(logging.ERROR)
+try:
+    from absl import logging as absl_logging
+    absl_logging.set_verbosity(absl_logging.ERROR)
+except ImportError:
+    pass
 
 import pickle
 import json

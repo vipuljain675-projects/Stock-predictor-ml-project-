@@ -561,8 +561,13 @@ _ml_assets_cache = {}
 
 def load_ml_assets(ticker: str):
     clean_ticker = ticker.replace("^", "").replace("=", "")
+    model_path  = f"lstm_model_{clean_ticker}.h5"
+    scaler_path = f"scaler_{clean_ticker}.pkl"
+
     if clean_ticker in _ml_assets_cache:
-        return _ml_assets_cache[clean_ticker]
+        cached = _ml_assets_cache[clean_ticker]
+        if not cached[3] or not (os.path.exists(model_path) and os.path.exists(scaler_path)):
+            return cached
 
     model_path  = f"lstm_model_{clean_ticker}.h5"
     scaler_path = f"scaler_{clean_ticker}.pkl"
@@ -652,6 +657,22 @@ def engineer_features(ohlcv_df, sentiment_series, macro_series_dict):
             obv.append(obv[-1])
     df['OBV'] = np.array(obv) / 1e7
 
+    # New stationary features (for v2 models)
+    df['Ret_Close'] = df['Close'].pct_change(1)
+    df['Ret_Open']  = df['Open'].pct_change(1)
+    df['Ret_High']  = df['High'].pct_change(1)
+    df['Ret_Low']   = df['Low'].pct_change(1)
+    df['Ret_Volume'] = df['Volume'].pct_change(1).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+
+    df['Close_to_SMA10'] = df['Close'] / (df['SMA_10'] + 1e-9)
+    df['Close_to_SMA20'] = df['Close'] / (df['SMA_20'] + 1e-9)
+    df['Close_to_EMA20'] = df['Close'] / (df['EMA_20'] + 1e-9)
+    df['Close_to_EMA50'] = df['Close'] / (df['EMA_50'] + 1e-9)
+
+    df['RSI_Scaled'] = df['RSI'] / 100.0
+    df['MACD_Price_Ratio'] = df['MACD'] / (df['Close'] + 1e-9)
+    df['OBV_pct'] = df['OBV'].pct_change(1).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+
     df = df.merge(sentiment_series.rename('Sentiment'), left_index=True, right_index=True, how='left')
     df['Sentiment'] = df['Sentiment'].fillna(0.0)
 
@@ -697,10 +718,11 @@ def run_7day_prediction(model, scaler, target_scaler, is_fallback, stock_df, new
     )
     if model_usable:
         try:
-            scaler_min_close = scaler.data_min_[0]
-            scaler_max_close = scaler.data_max_[0]
-            if last_price > scaler_max_close * 5 or last_price < scaler_min_close / 5:
-                model_usable = False
+            if FEATURES[0] == "Close":
+                scaler_min_close = scaler.data_min_[0]
+                scaler_max_close = scaler.data_max_[0]
+                if last_price > scaler_max_close * 5 or last_price < scaler_min_close / 5:
+                    model_usable = False
         except Exception:
             model_usable = False
 

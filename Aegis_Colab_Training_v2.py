@@ -296,6 +296,32 @@ history = model.fit(
 )
 
 # =====================================================================
+# 📊 TRAINING CURVES VISUALIZATION
+# =====================================================================
+print('\n📈 Visualizing training curves...')
+try:
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    axes[0].plot(history.history['loss'], label='Train Loss')
+    axes[0].plot(history.history['val_loss'], label='Val Loss')
+    axes[0].set_title('Huber Loss')
+    axes[0].set_xlabel('Epochs')
+    axes[0].set_ylabel('Loss')
+    axes[0].legend()
+
+    axes[1].plot(history.history['mae'], label='Train MAE')
+    axes[1].plot(history.history['val_mae'], label='Val MAE')
+    axes[1].set_title('Mean Absolute Error (MAE)')
+    axes[1].set_xlabel('Epochs')
+    axes[1].set_ylabel('MAE')
+    axes[1].legend()
+    plt.tight_layout()
+    plt.savefig('training_curves.png')
+    plt.show()
+    print("✅ Saved training curves plot as 'training_curves.png'")
+except Exception as e:
+    print(f"⚠️ Could not plot graphs: {e}")
+
+# =====================================================================
 # 📈 EVALUATION & ACCURACY TESTS
 # =====================================================================
 print('\n📊 Testing model accuracy on validation dataset...')

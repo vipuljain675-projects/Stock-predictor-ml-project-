@@ -201,19 +201,25 @@ print(f'   Train Records: {len(train_data)} | Val Records: {len(test_data)}')
 # 🔄 CREATE SEQUENCES & TARGET SCALING
 # =====================================================================
 def create_sequences(scaled_data, raw_close, lookback):
-    X, y, prev_close = [], [], []
+    X_tech, X_macro, y, prev_close = [], [], [], []
     for i in range(lookback, len(scaled_data)):
-        X.append(scaled_data[i - lookback:i, :])
+        # Technical features are the first 15 columns (index 0 to 14)
+        X_tech.append(scaled_data[i - lookback:i, :15])
+        # Macro features are the remaining columns (index 15 onwards)
+        # We take the macro state at the end of the sequence (index i-1)
+        X_macro.append(scaled_data[i - 1, 15:])
+        
         # Next-day return is target
         ret = (raw_close[i] - raw_close[i - 1]) / (raw_close[i - 1] + 1e-9)
         y.append(ret)
         prev_close.append(raw_close[i - 1])
-    return (np.array(X, dtype=np.float32),
+    return (np.array(X_tech, dtype=np.float32),
+            np.array(X_macro, dtype=np.float32),
             np.array(y, dtype=np.float32),
             np.array(prev_close, dtype=np.float32))
 
-X_train, y_train_ret, prev_close_train = create_sequences(train_data, df['Close'].values[:split], LOOKBACK)
-X_test,  y_test_ret,  prev_close_test  = create_sequences(test_data,  df['Close'].values[split:], LOOKBACK)
+X_train_tech, X_train_macro, y_train_ret, prev_close_train = create_sequences(train_data, df['Close'].values[:split], LOOKBACK)
+X_test_tech,  X_test_macro,  y_test_ret,  prev_close_test  = create_sequences(test_data,  df['Close'].values[split:], LOOKBACK)
 
 target_scaler = StandardScaler()
 y_train = target_scaler.fit_transform(y_train_ret.reshape(-1, 1)).flatten().astype(np.float32)
@@ -222,7 +228,7 @@ y_test  = target_scaler.transform(y_test_ret.reshape(-1, 1)).flatten().astype(np
 with open(TARGET_SCALER_FILE, 'wb') as f:
     pickle.dump(target_scaler, f)
 
-print(f'✅ Sequence tensors loaded. Shape: {X_train.shape}')
+print(f'✅ Sequence tensors loaded. Tech Shape: {X_train_tech.shape} | Macro Shape: {X_train_macro.shape}')
 print(f'✅ Target scaling applied. Saved to: {TARGET_SCALER_FILE}')
 
 # =====================================================================
@@ -250,10 +256,10 @@ class SelfAttention(Layer):
     def compute_output_shape(self, input_shape):
         return (input_shape[0], input_shape[-1])
 
-def build_model(lookback, n_features):
-    inp = Input(shape=(lookback, n_features), name='price_input')
-    
-    x = Bidirectional(LSTM(64, return_sequences=True), name='bilstm_1')(inp)
+def build_model(lookback, n_tech_features, n_macro_features):
+    # Tower 1: Nifty Technicals Sequence (LSTM + Self-Attention)
+    inp_tech = Input(shape=(lookback, n_tech_features), name='tech_input')
+    x = Bidirectional(LSTM(64, return_sequences=True), name='bilstm_1')(inp_tech)
     x = BatchNormalization()(x)
     x = Dropout(0.25)(x)
 
@@ -262,11 +268,21 @@ def build_model(lookback, n_features):
     x = SelfAttention(name='self_attention')(x)
     x = Dropout(0.20)(x)
 
-    x = Dense(32, activation='relu', name='dense_1')(x)
-    x = Dropout(0.15)(x)
-    out = Dense(1, name='output')(x)
+    # Tower 2: Macro Indicators (Dense Block)
+    inp_macro = Input(shape=(n_macro_features,), name='macro_input')
+    y = Dense(16, activation='relu', name='macro_dense_1')(inp_macro)
+    y = BatchNormalization()(y)
+    y = Dropout(0.15)(y)
 
-    model = Model(inp, out)
+    # Fusion Layer
+    merged = tf.keras.layers.concatenate([x, y], name='fusion_layer')
+
+    # Decision Layer
+    z = Dense(32, activation='relu', name='dense_1')(merged)
+    z = Dropout(0.15)(z)
+    out = Dense(1, name='output')(z)
+
+    model = Model(inputs=[inp_tech, inp_macro], outputs=out)
     model.compile(
         optimizer=Adam(learning_rate=0.0005), # Slightly lower learning rate for stable convergence
         loss='huber',
@@ -274,7 +290,9 @@ def build_model(lookback, n_features):
     )
     return model
 
-model = build_model(LOOKBACK, n_features)
+n_tech_features = 15
+n_macro_features = n_features - n_tech_features
+model = build_model(LOOKBACK, n_tech_features, n_macro_features)
 model.summary()
 
 # =====================================================================
@@ -287,8 +305,8 @@ callbacks = [
 
 print('\n🚀 Starting training loop...')
 history = model.fit(
-    X_train, y_train,
-    validation_data=(X_test, y_test),
+    [X_train_tech, X_train_macro], y_train,
+    validation_data=([X_test_tech, X_test_macro], y_test),
     epochs=EPOCHS,
     batch_size=BATCH_SIZE,
     callbacks=callbacks,
@@ -325,7 +343,7 @@ except Exception as e:
 # 📈 EVALUATION & ACCURACY TESTS
 # =====================================================================
 print('\n📊 Testing model accuracy on validation dataset...')
-pred_ret_scaled = model.predict(X_test, verbose=0)
+pred_ret_scaled = model.predict([X_test_tech, X_test_macro], verbose=0)
 pred_return = target_scaler.inverse_transform(pred_ret_scaled).flatten()
 
 # Check raw variance to ensure it's not dead/flat

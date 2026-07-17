@@ -649,7 +649,7 @@ export default function AegisDashboard() {
                               {item.unit === "$" || item.unit === "₹" ? item.unit : ""}{item.value.toLocaleString("en-US", { minimumFractionDigits: 2 })}{item.unit !== "$" && item.unit !== "₹" ? item.unit : ""}
                             </div>
                             <div className={`font-mono text-[10px] font-bold ${changeColorClass}`}>
-                              {item.trend === "up" ? "▲" : "▼"} {changeSign}{item.change_pct.toFixed(2)}% (30d)
+                              {item.trend === "up" ? "▲" : "▼"} {changeSign}{item.change_pct.toFixed(2)}% (5d)
                             </div>
                           </div>
                         </div>

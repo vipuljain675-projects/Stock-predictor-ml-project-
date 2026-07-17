@@ -277,8 +277,9 @@ def fetch_macro_indicators(ticker_symbol: str) -> dict:
                 if isinstance(close, pd.DataFrame):
                     close = close.iloc[:, 0]
                 latest = float(close.iloc[-1])
-                prev_30 = float(close.iloc[0]) if len(close) > 1 else latest
-                change_pct = ((latest - prev_30) / prev_30) * 100
+                # Calculate the 5-day percentage change (matching the 5-day window the model uses)
+                prev_5 = float(close.iloc[-6]) if len(close) > 5 else (float(close.iloc[0]) if len(close) > 0 else latest)
+                change_pct = ((latest - prev_5) / (prev_5 + 1e-9)) * 100
                 results[key] = {
                     "label": sig["label"],
                     "unit": sig["unit"],
@@ -740,22 +741,23 @@ def run_7day_prediction(model, scaler, target_scaler, is_fallback, stock_df, new
         shock = detect_market_shocks_llm(news_df, ticker_symbol, groq_key=groq_api_key, gemini_key=gemini_api_key)
         shock_magnitude = shock.get('magnitude', 1.0) if shock else 1.0
 
-        # Volatility-scaled Geopolitical Adjustment, now scaled by event magnitude/confidence
+        # Volatility-scaled Geopolitical Adjustment, now scaled by event magnitude/confidence (damped for realistic magnitudes)
         geopolitical_adjustment = 0.0
         if ticker_symbol == "BZ=F":
-            # Brent Crude rises on geopolitical tension (negative sentiment)
-            geopolitical_adjustment = -current_sentiment * volatility
+            # Brent Crude rises on geopolitical tension (negative sentiment) - Damped multiplier to 0.4
+            geopolitical_adjustment = -current_sentiment * 0.4 * volatility
             if shock:
                 if shock['type'] == 'Supply shock':
-                    geopolitical_adjustment += 1.5 * volatility * shock_magnitude
+                    # Damped from 1.5 to 0.5 for realistic shock response (~0.7% - 0.9%)
+                    geopolitical_adjustment += 0.5 * volatility * shock_magnitude
                 elif shock['type'] == 'De-escalation':
-                    geopolitical_adjustment -= 1.5 * volatility * shock_magnitude
+                    geopolitical_adjustment -= 0.5 * volatility * shock_magnitude
         else:  # ^NSEI
-            # Nifty falls on geopolitical tension (negative sentiment)
-            geopolitical_adjustment = current_sentiment * 0.3 * volatility
+            # Nifty falls on geopolitical tension (negative sentiment) - Damped multiplier to 0.1
+            geopolitical_adjustment = current_sentiment * 0.1 * volatility
             if shock:
-                # Severity-based dynamic multiplier (Black Swan vs Routine News)
-                nifty_multiplier = 0.6 if shock_magnitude >= 0.8 else 0.3
+                # Severity-based dynamic multiplier - Damped from 0.6/0.3 to 0.2/0.1 (~40-50 Nifty points max)
+                nifty_multiplier = 0.2 if shock_magnitude >= 0.8 else 0.1
                 if shock['type'] == 'Supply shock':
                     geopolitical_adjustment -= nifty_multiplier * volatility * shock_magnitude
                 elif shock['type'] == 'De-escalation':
@@ -771,9 +773,15 @@ def run_7day_prediction(model, scaler, target_scaler, is_fallback, stock_df, new
             feats_now = engineer_features(working_ohlcv_raw, working_sent_raw, working_macro_raw).dropna()
             seq = feats_now[FEATURES].values[-LOOKBACK:]
             scaled_seq = scaler.transform(seq)
-            X = np.expand_dims(scaled_seq, axis=0)
+            
+            # Split features: first 15 columns are Nifty technicals sequence, the rest are macros
+            tech_seq = scaled_seq[:, :15]
+            macro_state = scaled_seq[-1, 15:]
+            
+            X_tech = np.expand_dims(tech_seq, axis=0)
+            X_macro = np.expand_dims(macro_state, axis=0)
 
-            pred_ret_scaled = model.predict(X, verbose=0)
+            pred_ret_scaled = model.predict([X_tech, X_macro], verbose=0)
             pred_return = float(target_scaler.inverse_transform(pred_ret_scaled)[0, 0])
 
             prev_price = float(working_ohlcv_raw['Close'].iloc[-1])
@@ -804,9 +812,15 @@ def run_7day_prediction(model, scaler, target_scaler, is_fallback, stock_df, new
             feats_now = engineer_features(working_ohlcv_adj, working_sent_adj, working_macro_adj).dropna()
             seq = feats_now[FEATURES].values[-LOOKBACK:]
             scaled_seq = scaler.transform(seq)
-            X = np.expand_dims(scaled_seq, axis=0)
+            
+            # Split features: first 15 columns are Nifty technicals sequence, the rest are macros
+            tech_seq = scaled_seq[:, :15]
+            macro_state = scaled_seq[-1, 15:]
+            
+            X_tech = np.expand_dims(tech_seq, axis=0)
+            X_macro = np.expand_dims(macro_state, axis=0)
 
-            pred_ret_scaled = model.predict(X, verbose=0)
+            pred_ret_scaled = model.predict([X_tech, X_macro], verbose=0)
             pred_return = float(target_scaler.inverse_transform(pred_ret_scaled)[0, 0])
 
             # Apply decayed geopolitical adjustment

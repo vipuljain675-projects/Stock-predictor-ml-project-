@@ -24,6 +24,6 @@
     "Macro_VIX_5d"
   ],
   "n_features": 20,
-  "directional_accuracy": 53.53,
-  "mape": 2.145400047302246
+  "directional_accuracy": 56.51,
+  "mape": 2.115299940109253
 }

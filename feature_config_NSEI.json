@@ -24,6 +24,6 @@
     "Macro_SP500_5d"
   ],
   "n_features": 20,
-  "directional_accuracy": 49.05,
-  "mape": 0.6065000295639038
+  "directional_accuracy": 55.89,
+  "mape": 0.5968000292778015
 }
